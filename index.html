@@ -1,0 +1,136 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data: blob:; connect-src https://api.anthropic.com; manifest-src 'self'; base-uri 'none'; form-action 'none'">
+<meta name="referrer" content="no-referrer">
+<title>Claude API Chat</title>
+<meta name="theme-color" content="#f7f5f2" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#1c1b1a" media="(prefers-color-scheme: dark)">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="Claude Chat">
+<meta name="apple-mobile-web-app-status-bar-style" content="default">
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="icon" type="image/png" href="icon-192.png">
+<link rel="apple-touch-icon" href="icon-180.png">
+<link rel="stylesheet" href="style.css">
+<script src="app.js" defer></script>
+</head>
+<body>
+<div id="app">
+  <aside id="sidebar" aria-label="Chats">
+    <button id="newChat" class="btn primary wide" type="button">New chat</button>
+    <nav id="chatList"></nav>
+    <div class="side-bottom">
+      <div id="spendLine" class="muted small"></div>
+      <button id="openSettings" class="btn wide" type="button">Settings</button>
+    </div>
+  </aside>
+  <div id="scrim" hidden></div>
+
+  <main id="main">
+    <header id="topbar">
+      <button id="toggleSide" class="icon-btn" type="button" aria-label="Show chats">&#9776;</button>
+      <div class="title-wrap">
+        <div id="chatTitle">New chat</div>
+        <div id="chatSub" class="muted small"></div>
+      </div>
+      <select id="modelSelect" aria-label="Model"></select>
+      <select id="effortSelect" aria-label="Effort"></select>
+    </header>
+
+    <section id="messages" aria-live="polite"></section>
+
+    <div id="composer">
+      <div id="banner" class="banner" hidden></div>
+      <div id="attachments"></div>
+      <div class="composer-row">
+        <button type="button" id="attachBtn" class="icon-btn round" aria-label="Attach files">+</button>
+        <input type="file" id="fileInput" multiple hidden accept="image/*,application/pdf,.pdf,.txt,.md,.csv,.json,.html,.xml,.js,.ts,.py,.css,.yaml,.yml,.fountain,.srt,.vtt,text/*">
+        <textarea id="input" rows="1" placeholder="Message Claude" aria-label="Message"></textarea>
+        <button type="button" id="sendBtn" class="send-btn" aria-label="Send">&#8593;</button>
+        <button type="button" id="stopBtn" class="send-btn stop" aria-label="Stop" hidden>&#9632;</button>
+      </div>
+    </div>
+  </main>
+</div>
+
+<div id="toast" class="toast" hidden></div>
+
+<dialog id="settings" aria-label="Settings">
+  <div class="sheet">
+    <div class="sheet-head">
+      <h1>Settings</h1>
+      <button id="closeSettings" class="btn" type="button">Done</button>
+    </div>
+
+    <section class="set" id="setKey">
+      <h2>API key</h2>
+      <p class="muted small">Paste a key from your Claude Console. It's saved only in this browser, and messages go straight from here to Anthropic.</p>
+      <div class="row">
+        <input id="keyInput" type="password" placeholder="sk-ant-..." autocomplete="off" autocapitalize="off" spellcheck="false">
+        <button id="keyShow" class="btn" type="button">Show</button>
+      </div>
+      <label class="check"><input type="checkbox" id="keyRemember" checked> Remember on this device</label>
+      <div class="row">
+        <button id="keySave" class="btn primary" type="button">Save key</button>
+        <button id="keyTest" class="btn" type="button">Test key</button>
+        <span id="keyStatus" class="muted small"></span>
+      </div>
+      <p class="small links"><a href="https://platform.claude.com/settings/keys" target="_blank" rel="noopener noreferrer">Get a key</a> <span class="muted">&middot;</span> <a href="https://platform.claude.com/settings/billing" target="_blank" rel="noopener noreferrer">Credits and billing</a></p>
+    </section>
+
+    <section class="set" id="setMemory">
+      <h2>Memory</h2>
+      <p id="packStatus" class="muted small"></p>
+      <div class="row">
+        <button id="packImport" class="btn" type="button">Import memory pack</button>
+        <input id="packFile" type="file" accept=".md,.txt,text/plain,text/markdown" hidden>
+        <button id="packPasteToggle" class="btn" type="button">Paste instead</button>
+        <button id="packClear" class="btn danger" type="button">Remove</button>
+      </div>
+      <div id="packPasteWrap" hidden>
+        <textarea id="packPaste" rows="6" placeholder="Paste the whole memory pack here" spellcheck="false"></textarea>
+        <button id="packPasteLoad" class="btn" type="button">Load pasted pack</button>
+      </div>
+      <p class="muted small">Each new chat starts with the memory loaded at that moment.</p>
+    </section>
+
+    <section class="set" id="setDefaults">
+      <h2>Model and replies</h2>
+      <label class="field">Model for new chats <select id="defModel"></select></label>
+      <label class="field">Effort <select id="defEffort"></select></label>
+      <label class="check"><input type="checkbox" id="optThinking"> Show Claude's thinking (a summary, tucked under "Thinking")</label>
+      <label class="check"><input type="checkbox" id="optWeb"> Web search in new chats (about $0.01 per search, plus the pages it reads)</label>
+      <label class="field">Longest reply, in tokens <input id="optMax" type="number" min="1024" max="128000" step="1024" inputmode="numeric"></label>
+      <div class="row">
+        <button id="loadModels" class="btn" type="button">Load all models from my account</button>
+        <span id="modelsStatus" class="muted small"></span>
+      </div>
+      <div class="row">
+        <input id="customModel" placeholder="Or type a model ID" autocapitalize="off" spellcheck="false">
+        <button id="addModel" class="btn" type="button">Add</button>
+      </div>
+    </section>
+
+    <section class="set" id="setSpend">
+      <h2>Spending</h2>
+      <p id="spendStatus"></p>
+      <label class="field">Warn me when this device passes, in dollars this month <input id="optWarn" type="number" min="0" step="5" inputmode="decimal"></label>
+      <p class="muted small">These are estimates from the token counts the API reports. Your real balance is on the Console's billing page.</p>
+    </section>
+
+    <section class="set" id="setData">
+      <h2>Chats on this device</h2>
+      <div class="row">
+        <button id="exportChats" class="btn" type="button">Export chats</button>
+        <button id="deleteAll" class="btn danger" type="button">Delete all chats</button>
+      </div>
+      <p class="muted small" id="aboutLine"></p>
+    </section>
+  </div>
+</dialog>
+</body>
+</html>
