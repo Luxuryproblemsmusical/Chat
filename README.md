@@ -14,6 +14,8 @@ Everything runs in your browser:
 2. Optional: import a memory pack (a plain-text file of notes about you) under Settings → Memory. Claude reads it when it's relevant.
 3. On iPhone, tap Share → Add to Home Screen so it opens like an app and keeps your key and chats.
 
+If the phone locks or you switch apps while a reply is coming in, the reply picks back up when you come back. The screen stays on while a reply streams. Busy-server errors and connection blips are retried on their own before anything shows as failed.
+
 ## Editing
 
 It's three plain files: `index.html` (layout), `style.css` (looks) and `app.js` (everything else). The model list and prices are at the top of `app.js`. Edit on GitHub and the site updates in a minute or so.

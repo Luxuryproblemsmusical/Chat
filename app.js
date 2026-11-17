@@ -10,7 +10,7 @@
 
 // ================= Config (edit freely) =================
 
-const APP_VERSION = '1.0';
+const APP_VERSION = '1.1';
 const API_VERSION = '2023-06-01';
 const MAX_TOOL_STEPS = 8;
 const WEB_SEARCH_PRICE = 0.01; // dollars per search
@@ -58,7 +58,7 @@ const DEFAULT_SETTINGS = {
 
 // ================= Internals =================
 
-const K = { key: 'acc.key', settings: 'acc.settings', compat: 'acc.compat', spend: 'acc.spend', models: 'acc.models', base: 'acc.apiBase' };
+const K = { key: 'acc.key', settings: 'acc.settings', compat: 'acc.compat', spend: 'acc.spend', models: 'acc.models', base: 'acc.apiBase', last: 'acc.lastChat', time: 'acc.timeScale' };
 const DROP_BETA = 'thinking-binding-controls-2026-08-01';
 const MEMORY_TOOL = {
   name: 'read_memory',
@@ -83,7 +83,16 @@ const state = {
   compat: {},
   extraModels: [],
   idbOk: true,
+  runningChatId: null,
 };
+
+// Keeping replies alive on a phone. iPhone freezes a web page when the screen locks or you switch
+// apps, which usually kills a reply that's still coming in. So the app keeps the screen awake while
+// a reply streams, notices when the page was frozen, and reconnects on its own.
+// acc.timeScale is only for testing (it speeds up every wait below).
+const SCALE = Math.min(1, Math.max(0.01, Number(lsGet(K.time, 1)) || 1));
+const TICK = Math.max(100, Math.round(1000 * SCALE));
+const watch = { attempt: null, lastTick: Date.now(), wake: null, waking: false, longKilled: false };
 
 // ---------- small helpers ----------
 const $ = (id) => document.getElementById(id);
@@ -354,11 +363,11 @@ function friendly(err) {
   if (m.includes('credit balance') || err.status === 402) return "You're out of API credits for now. Your plan's monthly credits come back with each billing cycle, or you can add credits in the Console.";
   if (err.status === 403) return "Your key isn't allowed to do that: " + err.message;
   if (err.status === 404) return 'Not found. That model may not be available to your account. (' + err.message + ')';
-  if (err.status === 429) return 'Rate limit hit' + (err.retryAfter ? '. Try again in about ' + err.retryAfter + ' seconds.' : '. Wait a moment and try again.');
+  if (err.status === 429) return 'Rate limit hit, even after waiting' + (err.retryAfter ? '. Try again in about ' + err.retryAfter + ' seconds.' : '. Wait a minute and try again.');
   if (err.status === 413) return 'That request is too big. Try smaller or fewer attachments.';
-  if (err.status === 529 || err.type === 'overloaded_error') return "Anthropic's API is overloaded right now. Try again in a minute.";
-  if (err.status >= 500) return 'The API had a problem. Try again.';
-  if (err.status === 0 || err.type === 'network') return "Couldn't reach Anthropic's API. Check your connection.";
+  if (err.status === 529 || err.type === 'overloaded_error') return "Anthropic's servers are overloaded right now (tried a few times). Try again in a minute.";
+  if (err.status >= 500) return "Anthropic's API had a problem (tried a few times). Try again in a minute.";
+  if (err.status === 0 || err.type === 'network' || err instanceof TypeError || /load failed|failed to fetch|network/.test(m)) return 'Lost the connection to Anthropic and couldn\'t get it back. Check your internet, then try again.';
   return err.message || 'Something went wrong.';
 }
 function apiMessages(chat) {
@@ -414,12 +423,14 @@ function adapt(err, chat) {
   return changed;
 }
 
-async function readSSE(resp, onUpdate) {
+async function readSSE(resp, onUpdate, att) {
   const reader = resp.body.getReader();
   const dec = new TextDecoder();
   const msg = { role: 'assistant', content: [], usage: {}, stop_reason: null, model: '' };
+  if (att) att.partial = msg;
   const json = {};
   let buf = '';
+  let ended = false;
   const handle = (raw) => {
     let data = '';
     for (const line of raw.split('\n')) if (line.startsWith('data:')) data += (data ? '\n' : '') + line.slice(5).replace(/^ /, '');
@@ -468,6 +479,7 @@ async function readSSE(resp, onUpdate) {
         if (ev.usage) Object.assign(msg.usage, ev.usage);
         break;
       }
+      case 'message_stop': ended = true; break;
       case 'error': {
         const e = ev.error || {};
         throw new ApiError(e.type === 'overloaded_error' ? 529 : 500, e.type || 'api_error', e.message || 'The stream stopped with an error.');
@@ -478,6 +490,7 @@ async function readSSE(resp, onUpdate) {
   };
   for (;;) {
     const r = await reader.read();
+    if (att) att.lastByteAt = Date.now();
     if (r.done) break;
     buf += dec.decode(r.value, { stream: true });
     buf = buf.replace(/\r\n/g, '\n');
@@ -486,32 +499,124 @@ async function readSSE(resp, onUpdate) {
   }
   if (buf.trim()) handle(buf);
   msg.content = msg.content.filter(Boolean);
+  // A real reply always ends with a stop reason. Without one, the line was cut partway.
+  if (!ended && !msg.stop_reason) throw new ApiError(0, 'network', 'The reply was cut off.');
   return msg;
 }
 
-async function streamOnce(chat, signal, onUpdate) {
-  let resp;
-  try {
-    resp = await fetch(apiBase() + '/v1/messages', {
-      method: 'POST',
-      headers: apiHeaders(chat.dropBlocks ? [DROP_BETA] : []),
-      body: JSON.stringify(buildBody(chat)),
-      signal,
-    });
-  } catch (e) {
-    if (e.name === 'AbortError') throw e;
-    throw new ApiError(0, 'network', e.message || 'Network error');
-  }
-  if (!resp.ok) throw await readError(resp);
-  return readSSE(resp, onUpdate);
+function abortError(partial) {
+  let e;
+  try { e = new DOMException('Stopped', 'AbortError'); } catch (x) { e = new Error('Stopped'); e.name = 'AbortError'; }
+  if (partial) e.partial = partial;
+  return e;
 }
 
-async function requestTurn(chat, signal, onUpdate) {
-  for (let attempt = 0; ; attempt++) {
-    try { return await streamOnce(chat, signal, onUpdate); }
-    catch (e) {
+// Waits ms, or rejects if Stop is tapped. With untilVisible, the clock starts once the app is on screen.
+function pause(ms, signal, untilVisible) {
+  return new Promise((resolve, reject) => {
+    let t = null;
+    const cleanup = () => { clearTimeout(t); document.removeEventListener('visibilitychange', onVis); signal.removeEventListener('abort', onAbort); };
+    const onAbort = () => { cleanup(); reject(abortError()); };
+    const start = () => { t = setTimeout(() => { cleanup(); resolve(); }, ms); };
+    const onVis = () => { if (document.visibilityState === 'visible') { document.removeEventListener('visibilitychange', onVis); start(); } };
+    if (signal.aborted) { reject(abortError()); return; }
+    signal.addEventListener('abort', onAbort);
+    if (untilVisible && document.visibilityState !== 'visible') document.addEventListener('visibilitychange', onVis);
+    else start();
+  });
+}
+
+// One request. Each gets its own off-switch so the watchdog can cut a dead line without ending the
+// whole reply; the Stop button still ends everything through `signal`.
+async function streamOnce(chat, signal, onUpdate) {
+  if (signal.aborted) throw abortError();
+  const ac = new AbortController();
+  const a = { ac, lastByteAt: Date.now(), suspectSince: 0, stalled: false, away: document.visibilityState !== 'visible', partial: null };
+  const relay = () => ac.abort();
+  signal.addEventListener('abort', relay);
+  watch.attempt = a;
+  // Anything that isn't a clean API error means the line was cut: the phone froze the page, the
+  // network blinked, or the watchdog gave up on a reply that went quiet.
+  const cut = (e) => {
+    if (signal.aborted) return abortError(a.partial);
+    if (e instanceof ApiError) { e.away = e.away || a.away; if (a.partial) e.partial = a.partial; return e; }
+    const x = new ApiError(0, 'network', a.stalled ? 'The reply went quiet.' : String((e && e.message) || 'Network error'));
+    x.away = a.away; x.partial = a.partial;
+    return x;
+  };
+  try {
+    let resp;
+    try {
+      resp = await fetch(apiBase() + '/v1/messages', {
+        method: 'POST',
+        headers: apiHeaders(chat.dropBlocks ? [DROP_BETA] : []),
+        body: JSON.stringify(buildBody(chat)),
+        signal: ac.signal,
+      });
+    } catch (e) { throw cut(e); }
+    a.lastByteAt = Date.now();
+    if (!resp.ok) throw await readError(resp);
+    try { return await readSSE(resp, onUpdate, a); } catch (e) { throw cut(e); }
+  } finally {
+    signal.removeEventListener('abort', relay);
+    if (watch.attempt === a) watch.attempt = null;
+  }
+}
+
+// 'drop' = the line was cut. 'busy' = Anthropic asked us to back off. Anything else gets shown.
+function failKind(e) {
+  if (!(e instanceof ApiError)) return 'other';
+  if (e.status === 0 || e.type === 'network') return 'drop';
+  if (e.status === 429 || e.status >= 500 || e.type === 'overloaded_error' || e.type === 'api_error') return 'busy';
+  return 'other';
+}
+function busyWait(e, n) {
+  const ra = parseFloat(e.retryAfter);
+  if (ra > 0) return Math.min(ra, 30) * 1000;
+  return [1500, 4000, 9000][Math.min(n, 3) - 1];
+}
+
+// A cut or failed request still used tokens (Anthropic bills what it generated before the line went).
+// Count it so the spend meter doesn't run low. Output is estimated from what arrived.
+function chargeFailed(chat, e) {
+  const m = e && e.partial;
+  const u0 = m && m.usage;
+  if (!u0 || !(u0.input_tokens || u0.cache_read_input_tokens || u0.cache_creation_input_tokens)) return;
+  const u = Object.assign({}, u0);
+  let chars = 0;
+  for (const b of m.content || []) if (b) chars += (b.text || '').length + (b.thinking || '').length;
+  u.output_tokens = Math.max(u.output_tokens || 0, Math.round(chars / 4));
+  addSpend(chat, costOf(chat.model, u));
+  e.partial = null;
+}
+
+async function requestTurn(chat, signal, onUpdate, onStatus) {
+  let adapts = 0, busy = 0, drops = 0, awayDrops = 0;
+  for (;;) {
+    try {
+      return await streamOnce(chat, signal, onUpdate);
+    } catch (e) {
       if (e.name === 'AbortError') throw e;
-      if (attempt < 5 && adapt(e, chat)) { onUpdate(null); continue; }
+      if (signal.aborted) throw abortError(e.partial);
+      if (adapts < 5 && adapt(e, chat)) { adapts++; onUpdate(null); continue; }
+      const kind = failKind(e);
+      // Drops from the phone going to sleep don't count against the limit the same way.
+      if (kind === 'drop' && (e.away ? ++awayDrops <= 10 : ++drops <= 3)) {
+        chargeFailed(chat, e);
+        onUpdate(null);
+        onStatus(e.away ? 'Reconnecting...' : 'Connection dropped. Reconnecting...');
+        await pause((e.away ? 500 : [700, 2000, 5000][drops - 1]) * SCALE, signal, true);
+        continue;
+      }
+      if (kind === 'busy' && ++busy <= 3) {
+        chargeFailed(chat, e);
+        onUpdate(null);
+        const ms = busyWait(e, busy);
+        const why = e.status === 429 ? 'Rate limited.' : (e.status === 529 || e.type === 'overloaded_error') ? "Anthropic's servers are busy." : 'The API hiccuped.';
+        onStatus(why + ' Trying again in ' + Math.max(1, Math.round(ms / 1000)) + 's...');
+        await pause(ms * SCALE, signal, false);
+        continue;
+      }
       throw e;
     }
   }
@@ -525,20 +630,28 @@ async function fetchModels() {
 }
 
 // ---------- the conversation loop ----------
-async function runAssistant(chat) {
+async function runAssistant(chat, startIdx) {
   const controller = new AbortController();
   state.controller = controller;
+  state.runningChatId = chat.id;
+  if (startIdx == null) startIdx = chat.messages.length;
+  // Saved with the chat: if the page dies mid-reply, the next launch knows to pick it back up.
+  chat.pending = { since: Date.now() };
+  watch.longKilled = false;
   setBusy(true);
-  const startIdx = chat.messages.length;
+  keepAwake(true);
+  const onStatus = (t) => { if (state.live) { state.live.status = t; scheduleLive(); } };
   try {
+    await saveChat(chat);
     for (let step = 0; step < MAX_TOOL_STEPS; step++) {
-      state.live = { chatId: chat.id, content: [] };
+      state.live = { chatId: chat.id, content: [], status: '' };
       renderMessages(true);
       const msg = await requestTurn(chat, controller.signal, (m) => {
         if (!state.live) return;
         state.live.content = m ? m.content : [];
+        if (m) state.live.status = '';
         scheduleLive();
-      });
+      }, onStatus);
       state.live = null;
       const cost = costOf(chat.model, msg.usage);
       const meta = { model: chat.model, usage: msg.usage, cost, stop: msg.stop_reason, ts: Date.now() };
@@ -559,19 +672,93 @@ async function runAssistant(chat) {
       break;
     }
   } catch (e) {
+    chargeFailed(chat, e);
     const partial = state.live && state.live.content ? state.live.content.filter(Boolean) : [];
     state.live = null;
     // Keep what streamed so it can be read, but leave this attempt out of what gets sent next.
     for (let i = startIdx; i < chat.messages.length; i++) chat.messages[i].meta = Object.assign({}, chat.messages[i].meta, { skip: true });
     chat.messages.push({ role: 'assistant', content: clone(partial), meta: { skip: true, error: friendly(e), stopped: e.name === 'AbortError', ts: Date.now(), model: chat.model } });
   } finally {
+    chat.pending = null;
     state.live = null;
     state.controller = null;
+    state.runningChatId = null;
+    keepAwake(false);
     chat.updated = Date.now();
     await saveChat(chat);
     setBusy(false);
     renderAll();
   }
+}
+
+// Screen wake lock while a reply streams, so setting the phone down doesn't lock it mid-reply.
+async function keepAwake(on) {
+  if (!on) {
+    const w = watch.wake; watch.wake = null;
+    if (w) { try { await w.release(); } catch (e) { /* already released */ } }
+    return;
+  }
+  if (watch.wake || watch.waking || !('wakeLock' in navigator) || document.visibilityState !== 'visible') return;
+  watch.waking = true;
+  try {
+    const w = await navigator.wakeLock.request('screen');
+    if (!state.controller) { w.release(); return; } // the reply finished while we were asking
+    watch.wake = w;
+    w.addEventListener('release', () => { if (watch.wake === w) watch.wake = null; });
+  } catch (e) { /* not supported or not allowed here; harmless */ }
+  finally { watch.waking = false; }
+}
+
+// The watchdog. When the timer hasn't run for a while, the page was frozen; if no data came in
+// meanwhile, the line is almost certainly dead, so cut it and reconnect. Also catches a reply that
+// has gone completely silent for minutes.
+setInterval(() => {
+  const now = Date.now();
+  const gap = now - watch.lastTick;
+  watch.lastTick = now;
+  const a = watch.attempt;
+  if (!a || a.stalled) return;
+  if (gap > 6000 * SCALE) {
+    a.away = true;
+    if (a.lastByteAt < now - gap + TICK && !a.suspectSince) a.suspectSince = now;
+  }
+  if (a.suspectSince && a.lastByteAt > a.suspectSince) a.suspectSince = 0;
+  if (document.visibilityState !== 'visible') return;
+  const deadAfterFreeze = a.suspectSince && now - a.suspectSince > 10000 * SCALE;
+  const silentTooLong = !watch.longKilled && now - a.lastByteAt > 180000 * SCALE;
+  if (deadAfterFreeze || silentTooLong) {
+    if (!deadAfterFreeze) watch.longKilled = true;
+    a.stalled = true;
+    a.ac.abort();
+  }
+}, TICK);
+
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState !== 'visible') { if (watch.attempt) watch.attempt.away = true; return; }
+  if (state.controller) keepAwake(true);
+});
+
+// A reply that was still coming in when the page died (iPhone sometimes closes a home-screen app
+// in the background). Returns the index of that turn's question, or -1.
+function cutTurnIdx(chat) {
+  if (!chat || !chat.pending || state.runningChatId === chat.id) return -1;
+  for (let i = chat.messages.length - 1; i >= 0; i--) {
+    const m = chat.messages[i];
+    if (m.role === 'user' && !(m.meta && m.meta.tool)) return i;
+  }
+  return -1;
+}
+// Pick a cut-off reply back up if it's recent; if it's older, the chat shows Try again instead.
+async function resumeIfCut(chat) {
+  const u = cutTurnIdx(chat);
+  if (u < 0 || state.controller || !state.apiKey) return;
+  const last = chat.messages[chat.messages.length - 1];
+  if (last.role === 'assistant' && !(last.meta && last.meta.stop === 'pause_turn')) {
+    chat.pending = null; await saveChat(chat); renderAll(); return; // it had actually finished
+  }
+  if (Date.now() - (chat.pending.since || 0) > 15 * 60 * 1000) return;
+  toast('Picking up the reply that got cut off...');
+  await runAssistant(chat, u + 1);
 }
 
 async function onSend(textOverride) {
@@ -587,6 +774,7 @@ async function onSend(textOverride) {
     state.chat = chat;
     state.chats.unshift(chat);
   }
+  lsSet(K.last, chat.id);
   const content = files.map((f) => f.block);
   if (text) content.push({ type: 'text', text });
   chat.messages.push({ role: 'user', content, meta: { ts: Date.now() } });
@@ -988,10 +1176,12 @@ function renderMessages(scrollToEnd) {
     else if (turn && m.role === 'assistant') turn.assistant.push(m);
   });
   const liveHere = state.live && state.live.chatId === chat.id;
+  const cutIdx = cutTurnIdx(chat);
   turns.forEach((t, ti) => {
     box.appendChild(renderUser(t.user));
     const isLast = ti === turns.length - 1;
-    if (!t.assistant.length && !(isLast && liveHere)) return;
+    const cutHere = isLast && !liveHere && cutIdx === t.userIdx;
+    if (!t.assistant.length && !(isLast && liveHere) && !cutHere) return;
     const wrap = el('div', 'msg assistant');
     const sources = [];
     for (const a of t.assistant) {
@@ -1015,8 +1205,13 @@ function renderMessages(scrollToEnd) {
       fillLive(live);
       wrap.appendChild(live);
     } else {
+      if (cutHere) {
+        const n = el('div', 'note', 'This reply got cut off when the app closed.');
+        if (!state.controller) { const b = el('button', 'btn small-btn', 'Try again'); b.type = 'button'; b.onclick = () => retryTurn(t.userIdx); n.appendChild(b); }
+        wrap.appendChild(n);
+      }
       renderSources(wrap, sources);
-      wrap.appendChild(renderFooter(t, isLast));
+      if (t.assistant.length) wrap.appendChild(renderFooter(t, isLast));
     }
     box.appendChild(wrap);
   });
@@ -1028,6 +1223,7 @@ function fillLive(node) {
   const content = (state.live && state.live.content) || [];
   const sources = [];
   renderBlocks(node, content, true, sources);
+  if (state.live && state.live.status) node.appendChild(el('div', 'live-status', state.live.status));
   const visible = content.some((b) => b && ((b.type === 'text' && b.text) || (b.type === 'thinking' && b.thinking)));
   const last = content.filter(Boolean).slice(-1)[0];
   if (!visible || (last && last.type !== 'text')) node.appendChild(typingDots());
@@ -1147,10 +1343,12 @@ function openChat(id) {
   const c = state.chats.find((x) => x.id === id);
   if (!c) return;
   state.chat = c;
+  lsSet(K.last, id);
   document.body.classList.remove('side-open');
   $('scrim').hidden = true;
   renderAll();
   const box = $('messages'); box.scrollTop = box.scrollHeight;
+  resumeIfCut(c);
 }
 async function deleteChat(id) {
   if (state.controller && state.chat && state.chat.id === id) stopStreaming();
@@ -1162,6 +1360,7 @@ async function deleteChat(id) {
 function newChat() {
   if (state.controller) return;
   state.chat = null;
+  lsSet(K.last, null);
   document.body.classList.remove('side-open');
   $('scrim').hidden = true;
   renderAll();
@@ -1349,8 +1548,13 @@ async function init() {
     state.idbOk = false;
   }
   try { if (navigator.storage && navigator.storage.persist) navigator.storage.persist(); } catch (e) { /* ignore */ }
+  // Reopen the chat you were in if it's recent, or if its reply got cut off when the app closed.
+  const lastId = lsGet(K.last, null);
+  const last = lastId ? state.chats.find((c) => c.id === lastId) : null;
+  if (last && (last.pending || Date.now() - (last.updated || 0) < 30 * 60 * 1000)) state.chat = last;
   renderAll();
   if (!state.apiKey) openSettings();
+  else if (state.chat) { const box = $('messages'); box.scrollTop = box.scrollHeight; resumeIfCut(state.chat); }
 }
 
 init();
